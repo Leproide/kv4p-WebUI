@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- Author: https://github.com/Leproide -->
 
-# kv4p WebUI
+# kv4p Web-UI
 
 Cross-platform **web client for the [kv4p HT](https://www.kv4p.com/)** open-source
 ham radio: voice RX/TX, frequency scanner, memories, and **SSTV image transmit /
@@ -86,6 +86,12 @@ Two ways to test **without a second radio**:
 
 Over the air, remember the kv4p compresses audio with a **lossy voice codec**, so
 image quality is limited; **Martin M1** and **Robot 36** are the most robust.
+
+#### SSTV demo video
+
+Sending and receiving an image with kv4p-web:
+
+[![SSTV demo: transmitting and decoding an image with kv4p-web](https://img.youtube.com/vi/CnqYeDS01r0/maxresdefault.jpg)](https://youtu.be/CnqYeDS01r0)
 
 ## Troubleshooting
 
