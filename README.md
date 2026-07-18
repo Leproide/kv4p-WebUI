@@ -31,10 +31,15 @@ firmware's audio codec**: legacy **Opus** (command `0x07`) or **4-bit ADPCM**
   automatically. Click to load and tune.
 - **SSTV** — send and receive images. Encodes **all PySSTV modes** (Martin M1/M2,
   Scottie S1/S2, Robot 36, PD90, PD120, plus B/W Robot 8/24). Decoding supports
-  **Martin M1/M2** with automatic VIS detection.
+  **Martin M1/M2** with automatic VIS detection. Images are sent through a
+  high-bitrate Opus profile instead of the speech profile used for voice, which
+  roughly halves the codec damage to the tones.
+- **Station identification** — the callsign is shown in the header and beside the
+  TX indicator, appended to SSTV as a standard **FSK-ID**, and can optionally be
+  **burned into the picture** so any decoder shows it.
 - **Persistent settings** — TX-allowed, high power, pre-emphasis, high/low-pass,
-  squelch, bandwidth, frequency, CTCSS, PTT key and callsign survive restarts and
-  are re-applied to the radio after each connect.
+  squelch, bandwidth, frequency, CTCSS, PTT key, callsign and the callsign-overlay
+  choice survive restarts and are re-applied to the radio after each connect.
 
 ## Install & run
 
@@ -77,15 +82,26 @@ Choose a mode, pick an image and press **Send image** — the client generates t
 tones, keys the radio and paces the stream in real time. To receive, press
 **Receive** and then **Decode now**.
 
-Two ways to test **without a second radio**:
+**Identifying yourself.** The callsign is always appended as a standard FSK-ID.
+Because some decoders ignore it, or need it explicitly enabled (in MMSSTV:
+Option → Setup MMSSTV → RX → *Decode FSKID*), there is also an optional
+checkbox that paints the callsign onto the image itself — visible in any
+software. It is off by default and remembered between sessions.
+
+Three ways to test **without a second radio**:
 
 - **Self-test** — encodes the selected image and decodes it straight back, no
   radio involved. On a clean signal the round-trip is essentially lossless
   (correlation 1.000).
+- **Save as WAV** — renders the full transmission, image and FSK-ID included, to
+  a file you can feed to MMSSTV or QSSTV. Note that MMSSTV cannot open a WAV
+  directly: route it through a virtual audio cable, or Stereo Mix, and enable
+  *Auto slant* so the different playback clock does not skew the picture.
 - **Decode WAV** — decode any SSTV recording from a file.
 
-Over the air, remember the kv4p compresses audio with a **lossy voice codec**, so
-image quality is limited; **Martin M1** and **Robot 36** are the most robust.
+Over the air the kv4p compresses audio with a **lossy codec**, so quality is
+limited; **Martin M1** travels best and is also the mode this client decodes.
+Every mode can be transmitted, but reception here covers Martin M1/M2 only.
 
 #### SSTV demo video
 
@@ -102,9 +118,12 @@ Sending and receiving an image with kv4p-web:
 | No audio, `no RX audio ... frames` | Firmware isn't streaming — check squelch/signal |
 | RSSI stuck at 0 | RSSI is only sampled while RX audio is open |
 | `nvs_open failed: NOT_FOUND` at boot | Harmless first-run warning |
+| SSTV sent with no callsign | Station callsign left empty — the console logs the FSK-ID used for each transmission |
+| Slanted picture when decoding a WAV | Playback clock differs from the sound card; enable *Auto slant* in the decoder |
 
 Enable **raw hex** to inspect the wire: valid frames start with
-`c0 06 4b 56 34 50` (`"KV4P"`).
+`c0 06 4b 56 34 50` (`"KV4P"`). The build date is printed at startup and logged
+on connect, so it is easy to confirm which version is actually running.
 
 ## Transmitting responsibly
 

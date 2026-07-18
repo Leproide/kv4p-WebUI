@@ -55,11 +55,49 @@ _MARTIN_DECODE = {
 # --------------------------------------------------------------------------
 # Encoder
 # --------------------------------------------------------------------------
-def encode_image(image, mode_name, sample_rate, fskid=None):
+def _draw_callsign(img, text):
+    """Burn the callsign into the picture itself.
+
+    The FSK-ID is only shown by decoders that enable it (and some ignore it),
+    so painting the callsign on the image guarantees the receiving station
+    can read it whatever software they run.
+    """
+    from PIL import ImageDraw, ImageFont
+    w, h = img.size
+    size = max(12, h // 12)
+    font = None
+    for cand in ("arial.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "C:\\Windows\\Fonts\\arialbd.ttf", "C:\\Windows\\Fonts\\arial.ttf"):
+        try:
+            font = ImageFont.truetype(cand, size)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    draw = ImageDraw.Draw(img)
+    text = str(text).upper()
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        tw, th = box[2] - box[0], box[3] - box[1]
+    except Exception:
+        tw, th = draw.textsize(text, font=font)
+    x, y = max(2, w // 40), max(2, h // 40)
+    # dark plate behind the text so it stays readable over any picture
+    draw.rectangle([x - 4, y - 2, x + tw + 6, y + th + 8], fill=(0, 0, 0))
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=(255, 255, 255))
+    return img
+
+
+def encode_image(image, mode_name, sample_rate, fskid=None, overlay=None):
     """Return int16 mono numpy array of the SSTV signal for the given image.
 
     `image` may be a path, a PIL.Image, or raw image bytes.
-    `fskid` optionally appends an FSK-ID callsign at the end of the transmission.
+    `fskid` appends the standard FSK-ID callsign after the picture.
+    `overlay` paints that callsign into the picture itself.
     """
     if isinstance(image, (bytes, bytearray)):
         img = Image.open(io.BytesIO(image))
@@ -69,12 +107,12 @@ def encode_image(image, mode_name, sample_rate, fskid=None):
         img = Image.open(image)
     cls = ENCODE_MODES[mode_name]
     img = img.convert("RGB").resize((cls.WIDTH, cls.HEIGHT))
+    if overlay:
+        img = _draw_callsign(img, overlay)
     enc = cls(img, sample_rate, 16)
     if fskid:
-        try:
-            enc.add_fskid_text(str(fskid).upper()[:20])
-        except Exception:
-            pass
+        # let a failure surface: silently dropping the ID is worse than an error
+        enc.add_fskid_text(str(fskid).upper()[:20])
     return np.fromiter(enc.gen_samples(), dtype=np.int16)
 
 

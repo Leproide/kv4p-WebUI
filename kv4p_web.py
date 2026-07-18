@@ -129,6 +129,11 @@ AUDIO_FRAME = 320                 # samples per TX frame (20 ms)
 
 DEFAULT_BAUD = 115200
 AUTO_BAUDS = [115200, 921600, 230400]
+APP_VERSION = "2026-07-18"   # bump when behaviour changes; shown in the console
+# SSTV rides the same Opus stream as voice, but tones need far more bitrate than
+# speech. 40 kbit/s of audio is ~5 kB/s on the wire, well inside the 11.5 kB/s
+# the 115200-baud link provides (voice stays at the low-rate voip profile).
+SSTV_OPUS_BITRATE = 40000
 
 
 def kiss_escape(data):
@@ -189,7 +194,13 @@ def make_opus_decoder(rate):
     raise RuntimeError("no Opus decoder: %r" % last)
 
 
-def make_opus_encoder(rate, bitrate=24000, frame_ms=40):
+def make_opus_encoder(rate, bitrate=24000, frame_ms=40, application="voip"):
+    """Build an Opus encoder.
+
+    Voice uses the low-rate 'voip' profile. SSTV must use 'audio' at a higher
+    bitrate: the voip profile is tuned for speech and mangles the pure tones
+    that carry the image and the FSK-ID.
+    """
     last = None
     for name in ("libopus", "opus"):
         try:
@@ -200,7 +211,7 @@ def make_opus_encoder(rate, bitrate=24000, frame_ms=40):
             c.bit_rate = bitrate
             opts = {"frame_duration": str(frame_ms)}
             if name == "libopus":
-                opts["application"] = "voip"
+                opts["application"] = application
             else:
                 opts["strict"] = "experimental"
             c.options = opts
@@ -542,7 +553,7 @@ class AudioEngine:
             pass
 
     # ---- SSTV transmit ----
-    def start_sstv_tx(self, image_bytes, mode, fskid=None):
+    def start_sstv_tx(self, image_bytes, mode, fskid=None, overlay=None):
         if not SSTV_AVAILABLE:
             raise RuntimeError("SSTV unavailable: " + str(SSTV_ERR))
         if not self.radio.tx_allowed:
@@ -551,7 +562,11 @@ class AudioEngine:
             raise RuntimeError("busy")
         use_opus = (self.rx_audio_cmd == CMD_RX_AUDIO_OPUS)
         sr = 48000 if use_opus else AUDIO_SR
-        samples = sstv_mod.encode_image(image_bytes, mode, sr, fskid=fskid)
+        samples = sstv_mod.encode_image(image_bytes, mode, sr, fskid=fskid,
+                                        overlay=overlay)
+        self.radio._log("EVENT", "SSTV TX %s, %.1f s, FSK-ID: %s, overlay: %s"
+                        % (mode, len(samples) / sr, fskid if fskid else "(none)",
+                           overlay if overlay else "(none)"))
         self._sstv_tx_stop.clear()
         self.sstv_tx = {"running": True, "progress": 0, "mode": mode}
         # pause RX monitor during TX (half duplex)
@@ -567,7 +582,8 @@ class AudioEngine:
         frame = int(sr * 0.04) if use_opus else AUDIO_FRAME
         try:
             self.radio.set_ptt(True)
-            enc = make_opus_encoder(sr) if use_opus else None
+            enc = (make_opus_encoder(sr, bitrate=SSTV_OPUS_BITRATE,
+                                     application="audio") if use_opus else None)
             total = len(samples)
             i = 0
             t_next = time.time()
@@ -589,6 +605,26 @@ class AudioEngine:
                 dt = t_next - time.time()
                 if dt > 0:
                     time.sleep(dt)
+            # The radio buffers audio ahead of us, so the last second of the
+            # transmission (which is where the FSK-ID callsign lives) would be
+            # cut off if we dropped PTT here. Push trailing silence, then hold
+            # the carrier while the radio drains its buffer.
+            if not self._sstv_tx_stop.is_set():
+                silence = np.zeros(frame, dtype=np.int16)
+                for _ in range(max(1, int(0.6 * sr / frame))):
+                    if use_opus:
+                        af = av.AudioFrame.from_ndarray(silence.reshape(1, -1),
+                                                        format="s16", layout="mono")
+                        af.sample_rate = sr
+                        for p in enc.encode(af):
+                            self.radio.send_vendor(tx_cmd, bytes(p))
+                    else:
+                        self.radio.send_vendor(tx_cmd, self._enc.encode(silence))
+                    t_next += frame / sr
+                    dt = t_next - time.time()
+                    if dt > 0:
+                        time.sleep(dt)
+                time.sleep(1.5)   # let the radio play out what is still buffered
         except Exception as e:
             self.last_err = "SSTV TX: " + repr(e)
             self.radio._log("ERROR", "SSTV TX failed: " + repr(e))
@@ -736,6 +772,7 @@ class Radio:
         self.filt_low = True
         self.ptt_key = "Space"
         self.sstv_callsign = ""
+        self.sstv_overlay = False   # burn callsign into the picture
         self.saved_config = None   # persisted full config, applied on connect
         self.desired = {"memoryId": -1, "bw": 0, "freq_tx": 145.5, "freq_rx": 145.5,
                         "ctcss_tx": 0, "squelch": 0, "ctcss_rx": 0}
@@ -825,6 +862,7 @@ class Radio:
                 "freq_rx": self.desired["freq_rx"], "freq_tx": self.desired["freq_tx"],
                 "ctcss_tx": self.desired["ctcss_tx"], "ctcss_rx": self.desired["ctcss_rx"],
                 "ptt_key": self.ptt_key, "sstv_callsign": self.sstv_callsign,
+                "sstv_overlay": self.sstv_overlay,
             })
         except Exception:
             pass
@@ -904,6 +942,7 @@ class Radio:
         self._kbuf.clear()
         self._rawtext.clear()
         self._seq = 0
+        self._log("INFO", f"kv4p-web build {APP_VERSION}")
         self._log("INFO", "audio stack: " + ("available" if AUDIO_AVAILABLE
                   else "UNAVAILABLE (" + str(AUDIO_IMPORT_ERR) + ")"))
         self._log("INFO", f"connecting {port} baud={baud} reset={reset}")
@@ -1208,7 +1247,8 @@ class Radio:
                          "filt_low": self.filt_low, "squelch": self.desired["squelch"],
                          "bw": self.desired["bw"], "ctcss_tx": self.desired["ctcss_tx"],
                          "ctcss_rx": self.desired["ctcss_rx"], "ptt_key": self.ptt_key,
-                         "sstv_callsign": self.sstv_callsign}}
+                         "sstv_callsign": self.sstv_callsign,
+                         "sstv_overlay": self.sstv_overlay}}
 
 
 radio = Radio()
@@ -1271,6 +1311,7 @@ if "filt_low" in _settings:
     radio.filt_low = bool(_settings["filt_low"])
 radio.ptt_key = _settings.get("ptt_key", "Space")
 radio.sstv_callsign = _settings.get("sstv_callsign", "")
+radio.sstv_overlay = bool(_settings.get("sstv_overlay", False))
 for _k in ("bw", "squelch", "ctcss_tx", "ctcss_rx"):
     if _k in _settings:
         radio.desired[_k] = int(_settings[_k])
@@ -1477,6 +1518,42 @@ def api_sstv_callsign():
     return jsonify({"ok": True})
 
 
+@app.route("/api/sstv/overlay", methods=["POST"])
+def api_sstv_overlay():
+    d = request.get_json(force=True)
+    radio.sstv_overlay = bool(d.get("on"))
+    radio.persist()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sstv/wav", methods=["POST"])
+def api_sstv_wav():
+    """Render the SSTV signal (image + FSK-ID) to a WAV, no radio involved.
+
+    Lets the signal be fed straight into MMSSTV/QSSTV to tell a decoder-side
+    problem apart from an over-the-air one.
+    """
+    d = request.get_json(force=True)
+    try:
+        import io as _io
+        from scipy.io import wavfile
+        b = d["image"]
+        if "," in b:
+            b = b.split(",", 1)[1]
+        cs = str(d.get("callsign", radio.sstv_callsign or "")).strip()
+        samples = sstv_mod.encode_image(base64.b64decode(b),
+                                        d.get("mode", "Martin M1"),
+                                        48000, fskid=cs or None,
+                                        overlay=(cs or None) if d.get("overlay") else None)
+        buf = _io.BytesIO()
+        wavfile.write(buf, 48000, samples)
+        radio._log("EVENT", "SSTV WAV exported (%.1f s, FSK-ID: %s)"
+                   % (len(samples) / 48000, cs or "(none)"))
+        return jsonify({"ok": True, "wav": base64.b64encode(buf.getvalue()).decode()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.route("/api/sstv/selftest", methods=["POST"])
 def api_sstv_selftest():
     d = request.get_json(force=True)
@@ -1512,8 +1589,17 @@ def api_sstv_tx():
         img_b64 = d["image"]
         if "," in img_b64:
             img_b64 = img_b64.split(",", 1)[1]
+        # the UI sends the callsign with the request so it can never lag behind
+        # what is typed in the field
+        if "callsign" in d:
+            cs = str(d.get("callsign", "")).strip()
+            if cs != radio.sstv_callsign:
+                radio.sstv_callsign = cs
+                radio.persist()
         audio.start_sstv_tx(base64.b64decode(img_b64), d.get("mode", "Martin M1"),
-                            fskid=radio.sstv_callsign or None)
+                            fskid=radio.sstv_callsign or None,
+                            overlay=(radio.sstv_callsign or None)
+                            if d.get("overlay") else None)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -1726,6 +1812,8 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
   <div id="sstv-unavail" class="hint" style="display:none;color:var(--err)"></div>
   <label>Mode</label><select id="sstv_mode"></select>
   <div class="hint">FSK-ID uses the <b>Station callsign</b> set in Connection (empty = no ID).</div>
+  <label style="margin-top:6px"><input type="checkbox" id="sstv_overlay" onchange="setOverlay()" style="width:auto">
+   burn callsign into the image (optional — readable by any decoder)</label>
   <div class="btns">
    <input type="file" id="sstv_file" accept="image/*" style="flex:2;padding:5px">
    <button class="tx" onclick="sstvSend()">📤 Send image</button></div>
@@ -1736,7 +1824,9 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
    <button onclick="sstvDecode()">Decode now</button></div>
   <label style="margin-top:8px">Test without a radio</label>
   <div class="btns">
-   <button class="go" onclick="sstvSelftest()">🔄 Self-test (encode→decode selected image)</button></div>
+   <button class="go" onclick="sstvSelftest()">🔄 Self-test (encode→decode selected image)</button>
+   <button onclick="sstvWav()">💾 Save as WAV</button></div>
+  <a id="sstv_wavdl" style="display:none;font-size:12px;color:var(--blue)" download="sstv_tx.wav">⬇ download sstv_tx.wav</a>
   <div class="btns" style="margin-top:6px"><input type="file" id="sstv_wav" accept="audio/*,.wav" style="flex:2;padding:5px">
    <button onclick="sstvDecodeFile()">Decode WAV</button></div>
   <div class="hint" id="sstv_rxstat">RX idle</div>
@@ -1812,11 +1902,21 @@ async function sstvModes(){const d=await jg('/api/sstv/modes');const u=g('sstv-u
  u.style.display='none';const e=g('sstv_mode');e.innerHTML='';d.modes.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;e.appendChild(o)})}
 async function sstvSend(){const f=g('sstv_file').files[0];if(!f){g('sstv_txstat').textContent='pick an image first';return}
  if(!txAllowed){g('sstv_txstat').textContent='enable "TX allowed" first';return}
- const rd=new FileReader();rd.onload=async()=>{const r=await jp('/api/sstv/tx',{image:rd.result,mode:g('sstv_mode').value});
+ const rd=new FileReader();rd.onload=async()=>{const r=await jp('/api/sstv/tx',
+   {image:rd.result,mode:g('sstv_mode').value,callsign:g('callsign').value,overlay:g('sstv_overlay').checked});
   g('sstv_txstat').textContent=r.ok?'transmitting…':('ERR: '+r.error)};rd.readAsDataURL(f)}
 async function sstvRx(){const r=await jp('/api/sstv/rx',{on:!sstvRxOn});if(!r.ok)g('sstv_rxstat').textContent='ERR: '+r.error}
 async function sstvDecode(){const r=await jp('/api/sstv/decode');if(!r.ok)g('sstv_rxstat').textContent='ERR: '+r.error}
 async function setCall(){await jp('/api/sstv/callsign',{callsign:g('callsign').value})}
+async function setOverlay(){await jp('/api/sstv/overlay',{on:g('sstv_overlay').checked})}
+async function sstvWav(){const f=g('sstv_file').files[0];if(!f){g('sstv_rxstat').textContent='pick an image first';return}
+ g('sstv_rxstat').textContent='rendering WAV…';
+ const rd=new FileReader();rd.onload=async()=>{
+  const r=await jp('/api/sstv/wav',{image:rd.result,mode:g('sstv_mode').value,callsign:g('callsign').value,overlay:g('sstv_overlay').checked});
+  if(!r.ok){g('sstv_rxstat').textContent='ERR: '+r.error;return}
+  const a=g('sstv_wavdl');a.href='data:audio/wav;base64,'+r.wav;a.style.display='';
+  g('sstv_rxstat').textContent='WAV ready — feed it to MMSSTV to test the FSK-ID';
+  a.click()};rd.readAsDataURL(f)}
 async function sstvSelftest(){const f=g('sstv_file').files[0];if(!f){g('sstv_rxstat').textContent='pick an image first';return}
  const rd=new FileReader();rd.onload=async()=>{const r=await jp('/api/sstv/selftest',{image:rd.result,mode:g('sstv_mode').value});
   g('sstv_rxstat').textContent=r.ok?'self-test running…':('ERR: '+r.error)};rd.readAsDataURL(f)}
@@ -1899,7 +1999,8 @@ async function poll(){try{const s=await jg('/api/status');connected=s.connected;
  const c=s.ctrl||{};g('tx_allowed').checked=!!c.tx_allowed;g('high_power').checked=!!c.high_power;txAllowed=!!c.tx_allowed;
  g('f_pre').checked=!!c.filt_pre;g('f_high').checked=!!c.filt_high;g('f_low').checked=!!c.filt_low;
  if(!pttKeyLoaded&&c.ptt_key){pttKey=c.ptt_key;g('pttkeycap').textContent=keyName(pttKey);pttKeyLoaded=true}
- if(!callLoaded&&c.sstv_callsign!=null){g('callsign').value=c.sstv_callsign;callLoaded=true}
+ if(!callLoaded&&c.sstv_callsign!=null){g('callsign').value=c.sstv_callsign;
+  g('sstv_overlay').checked=!!c.sstv_overlay;callLoaded=true}
  const cb=g('call-badge');if(c.sstv_callsign){cb.textContent='📻 '+c.sstv_callsign;cb.style.display=''}else{cb.style.display='none'}
  if(!ctrlPrefilled&&c.squelch!=null){g('squelch').value=c.squelch;g('sqval').textContent=c.squelch;
   g('bw').value=c.bw;g('ctcss_tx').value=c.ctcss_tx;g('ctcss_rx').value=c.ctcss_rx;ctrlPrefilled=true}
@@ -1921,7 +2022,7 @@ def main():
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    print(f"kv4p-web running at {url}  (Ctrl+C to quit)")
+    print(f"kv4p-web build {APP_VERSION} running at {url}  (Ctrl+C to quit)")
     if not AUDIO_AVAILABLE:
         print(f"NOTE: voice disabled: {AUDIO_IMPORT_ERR}  -> pip install sounddevice numpy")
     try:
