@@ -1,0 +1,8 @@
+flask>=3.0
+pyserial>=3.5
+sounddevice>=0.4.6
+numpy>=1.24
+av>=11.0
+PySSTV>=0.5
+Pillow>=9.0
+scipy>=1.10
