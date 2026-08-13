@@ -125,7 +125,7 @@ DEVSTATE_LEN = struct.calcsize(DEVSTATE_FMT)
 DESIRED_FMT = "<IiHBffBBB"        # 22 bytes
 
 AUDIO_SR = 16000                  # firmware live-audio sample rate (mono)
-AUDIO_FRAME = 320                 # samples per TX frame (20 ms)
+AUDIO_FRAME = 249                 # samples in one 128-byte mono IMA-WAV block
 
 DEFAULT_BAUD = 115200
 AUTO_BAUDS = [115200, 921600, 230400]
@@ -222,21 +222,27 @@ def make_opus_encoder(rate, bitrate=24000, frame_ms=40, application="voip"):
 
 
 class ImaAdpcm:
-    """Continuous IMA/DVI 4-bit ADPCM codec (low nibble first)."""
+    """Mono IMA-WAV ADPCM blocks used by the firmware (low nibble first).
 
-    def __init__(self):
-        self.pred = 0
-        self.index = 0
+    Each packet is independently decodable: the first four bytes contain the
+    initial 16-bit predictor, step index, and a reserved byte.  The predictor
+    is also the first output sample, so a 128-byte packet represents 249 PCM
+    samples.
+    """
 
     def reset(self):
-        self.pred = 0
-        self.index = 0
+        # Blocks carry their own state; retained for callers switching streams.
+        pass
 
     def decode(self, data):
-        pred, index = self.pred, self.index
-        out = np.empty(len(data) * 2, dtype=np.int16)
-        k = 0
-        for byte in data:
+        if len(data) < 4:
+            return np.empty(0, dtype=np.int16)
+        pred, index, _reserved = struct.unpack_from("<hBB", data)
+        index = max(0, min(88, index))
+        out = np.empty(1 + (len(data) - 4) * 2, dtype=np.int16)
+        out[0] = pred
+        k = 1
+        for byte in data[4:]:
             for nib in (byte & 0x0F, (byte >> 4) & 0x0F):
                 step = _IMA_STEP[index]
                 diff = step >> 3
@@ -252,13 +258,15 @@ class ImaAdpcm:
                 index = 0 if index < 0 else 88 if index > 88 else index
                 out[k] = pred
                 k += 1
-        self.pred, self.index = pred, index
         return out
 
     def encode(self, samples):
-        pred, index = self.pred, self.index
+        samples = np.asarray(samples).reshape(-1)
+        if len(samples) == 0:
+            return b""
+        pred, index = int(samples[0]), 0
         nibbles = []
-        for s in samples:
+        for s in samples[1:]:
             step = _IMA_STEP[index]
             diff = int(s) - pred
             nib = 0
@@ -289,13 +297,13 @@ class ImaAdpcm:
             index += _IMA_INDEX[nib]
             index = 0 if index < 0 else 88 if index > 88 else index
             nibbles.append(nib)
-        self.pred, self.index = pred, index
-        out = bytearray((len(nibbles) + 1) // 2)
+        out = bytearray(4 + (len(nibbles) + 1) // 2)
+        struct.pack_into("<hBB", out, 0, int(samples[0]), 0, 0)
         for i, nib in enumerate(nibbles):
             if i & 1:
-                out[i >> 1] |= (nib << 4)
+                out[4 + (i >> 1)] |= (nib << 4)
             else:
-                out[i >> 1] = nib
+                out[4 + (i >> 1)] = nib
         return bytes(out)
 
 
