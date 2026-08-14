@@ -230,9 +230,13 @@ class ImaAdpcm:
     samples.
     """
 
+    def __init__(self):
+        self.index = 0
+
     def reset(self):
-        # Blocks carry their own state; retained for callers switching streams.
-        pass
+        # Decoders get state from each block header. Encoders carry the step
+        # index between blocks, matching the firmware's IMA-WAV encoder.
+        self.index = 0
 
     def decode(self, data):
         if len(data) < 4:
@@ -264,7 +268,8 @@ class ImaAdpcm:
         samples = np.asarray(samples).reshape(-1)
         if len(samples) == 0:
             return b""
-        pred, index = int(samples[0]), 0
+        pred, index = int(samples[0]), self.index
+        initial_index = index
         nibbles = []
         for s in samples[1:]:
             step = _IMA_STEP[index]
@@ -297,8 +302,9 @@ class ImaAdpcm:
             index += _IMA_INDEX[nib]
             index = 0 if index < 0 else 88 if index > 88 else index
             nibbles.append(nib)
+        self.index = index
         out = bytearray(4 + (len(nibbles) + 1) // 2)
-        struct.pack_into("<hBB", out, 0, int(samples[0]), 0, 0)
+        struct.pack_into("<hBB", out, 0, int(samples[0]), initial_index, 0)
         for i, nib in enumerate(nibbles):
             if i & 1:
                 out[4 + (i >> 1)] |= (nib << 4)
